@@ -2,6 +2,7 @@ import os
 import requests
 import psycopg
 from datetime import datetime, timedelta, timezone
+from time import monotonic as _monotonic
 from contextlib import contextmanager
 import zoneinfo
 
@@ -420,6 +421,72 @@ def fetch_ha_nordpool_and_save(date_obj):
     return False
 
 
+# ---- Dynamiska priser i HA (Amber) ---------------------------------------------------------------------------------
+# Nord Pool-priser är låsta när de publiceras, därför sparas de en gång (ON CONFLICT DO NOTHING). Amber reviderar
+# prognosen för kommande intervall var 5:e minut, så där ersätts de framtida raderna i stället.
+HA_REFRESH_SECONDS = 120
+HA_REFRESH_INTEGRATIONS = ("Amber Electric",)    # känns igen av recognize_price_entity(); PRICE_HA_REFRESH=true/false övertrumfar
+_last_ha_refresh = None
+
+
+def refresh_ha_prices(now=None):
+    """Hämtar prissensorn en gång och ersätter alla lagrade rader från första nya intervallet och framåt, i en
+    transaktion. Rader som redan passerat rörs inte, intervallet som pågår beskärs i stället för att raderas, och
+    en tom eller misslyckad hämtning lämnar allt som det är. True om rader skrevs."""
+    import homeassistant
+    mode = str(_setting("price_ha_refresh", "PRICE_HA_REFRESH", "auto")).strip().lower()
+    if mode in ("0", "false", "nej", "no"):
+        return False
+    now = now or datetime.now(SWE_TZ)
+    rows = []
+    for entity in _price_entities():
+        try:
+            r = requests.get(f"{homeassistant._BASE}/states/{entity}", headers=homeassistant._HEADERS, timeout=10,
+                             verify=homeassistant._VERIFY)
+        except requests.RequestException as e:
+            print(f"⚠️ HA-prissensorn ({entity}) kunde inte läsas: {e}")
+            continue
+        if r.status_code != 200:
+            continue
+        state = r.json()
+        if mode not in ("1", "true", "ja", "yes") and recognize_price_entity(state) not in HA_REFRESH_INTEGRATIONS:
+            continue
+        attrs = state.get("attributes", {})
+        rows += parse_price_attributes(attrs, attrs.get("unit_of_measurement", ""))
+    fresh = [(s, e, v) for s, e, v in rows if e > now]
+    if not fresh:
+        return False
+    boundary = min(s for s, _, _ in fresh)
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM elpriser WHERE time_start >= %s", (boundary,))
+            cur.execute("UPDATE elpriser SET time_end = %s WHERE time_start < %s AND time_end > %s",
+                        (boundary, boundary, boundary))
+            cur.executemany("""
+                INSERT INTO elpriser (time_start, time_end, sek_per_kwh)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (time_start) DO UPDATE SET time_end = EXCLUDED.time_end, sek_per_kwh = EXCLUDED.sek_per_kwh
+            """, fresh)
+        conn.commit()
+    return True
+
+
+def refresh_ha_prices_if_due(monotonic=None, now=None):
+    """Anropas varje varv från ensure_prices_exist(); hämtar högst var HA_REFRESH_SECONDS och bara för HA-sensorer."""
+    global _last_ha_refresh
+    if price_source() != "ha_nordpool":
+        return False
+    t = _monotonic() if monotonic is None else monotonic
+    if _last_ha_refresh is not None and t - _last_ha_refresh < HA_REFRESH_SECONDS:
+        return False
+    _last_ha_refresh = t
+    try:
+        return refresh_ha_prices(now)
+    except Exception as e:
+        print(f"❌ Fel vid uppdatering av HA-priser: {e}")
+        return False
+
+
 def _fetch_and_save(date_obj):
     """Hämtar och sparar ett dygns priser enligt konfigurerad PRICE_SOURCE, med automatisk
     fallback till elprisetjustnu.se samma cykel om den primära källan misslyckas - pris-
@@ -477,6 +544,28 @@ def ensure_prices_exist():
                             print("⚠️ Morgondagens priser kunde inte hämtas ännu – försöker igen nästa cykel.")
     except Exception as e:
         print(f"❌ Databasfel vid kontroll av priser: {e}")
+    refresh_ha_prices_if_due()
+
+
+PRICE_GAP_TOLERANCE = timedelta(minutes=10)
+
+
+def _price_at(cur, dt):
+    """Priset som gäller vid dt. Saknas en rad exakt då (omstart före första raden, eller en sekunds glapp mellan
+    Ambers rader, :00 -> :01) används närmaste rad inom PRICE_GAP_TOLERANCE. Annars None."""
+    cur.execute("""
+        SELECT sek_per_kwh FROM elpriser
+        WHERE time_start <= %s AND time_end > %s
+    """, (dt, dt))
+    row = cur.fetchone()
+    if row is None:
+        cur.execute("""
+            SELECT sek_per_kwh FROM elpriser
+            WHERE time_start <= %s AND time_end >= %s
+            ORDER BY GREATEST(time_start - %s, %s - time_end) LIMIT 1
+        """, (dt + PRICE_GAP_TOLERANCE, dt - PRICE_GAP_TOLERANCE, dt, dt))
+        row = cur.fetchone()
+    return float(row[0]) if row else None
 
 
 def get_price_at(dt):
@@ -484,12 +573,7 @@ def get_price_at(dt):
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT sek_per_kwh FROM elpriser
-                    WHERE time_start <= %s AND time_end > %s
-                """, (dt, dt))
-                row = cur.fetchone()
-                return float(row[0]) if row else None
+                return _price_at(cur, dt)
     except Exception as e:
         print(f"❌ Fel vid hämtning av pris för tidpunkt: {e}")
     return None
@@ -613,12 +697,7 @@ def get_price_info(cheap_hours_count=8):
         with get_db() as conn:
             with conn.cursor() as cur:
                 # Aktuellt pris
-                cur.execute("""
-                    SELECT sek_per_kwh FROM elpriser
-                    WHERE time_start <= %s AND time_end > %s
-                """, (now, now))
-                row = cur.fetchone()
-                current_price = float(row[0]) if row else None
+                current_price = _price_at(cur, now)
 
                 # FIX: Hämta alla kvarterspriser idag i TIDSORDNING (inte prisordning).
                 # Konsumenter (gpm.py prediktiv överladdning, notifier morgontips) indexerar
